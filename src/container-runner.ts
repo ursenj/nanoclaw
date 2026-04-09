@@ -25,6 +25,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -252,19 +253,46 @@ async function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
-  if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
+  // Credential injection: try multiple sources for an OAuth token.
+  // 1. Claude Code's credentials file (auto-refreshed, always fresh)
+  // 2. .env file (static copy, may go stale)
+  // 3. API key via OneCLI gateway
+  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  let oauthToken = secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
+
+  // Prefer the live token from Claude Code's credentials file (auto-refreshed)
+  try {
+    const credsPath = path.join(process.env.HOME || '', '.claude', '.credentials.json');
+    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+    const liveToken = creds?.claudeAiOauth?.accessToken;
+    if (liveToken) {
+      oauthToken = liveToken;
+      logger.info({ containerName }, 'Using live OAuth token from ~/.claude/.credentials.json');
+    }
+  } catch {
+    // credentials file not found or unreadable — fall through to .env
+  }
+
+  if (oauthToken) {
+    // OAuth mode: pass token directly, SDK handles auth natively
+    args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
+    logger.info({ containerName }, 'OAuth token injected directly');
+  } else if (secrets.ANTHROPIC_API_KEY) {
+    // API key mode: use OneCLI gateway for secure injection
+    const onecliApplied = await onecli.applyContainerConfig(args, {
+      addHostMapping: false,
+      agent: agentIdentifier,
+    });
+    if (onecliApplied) {
+      logger.info({ containerName }, 'OneCLI gateway config applied');
+    } else {
+      logger.warn(
+        { containerName },
+        'OneCLI gateway not reachable — container will have no credentials',
+      );
+    }
   } else {
-    logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
-    );
+    logger.warn({ containerName }, 'No credentials found in .env');
   }
 
   // Runtime-specific args for host gateway resolution
